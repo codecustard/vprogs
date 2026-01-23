@@ -1,5 +1,7 @@
 extern crate core;
 
+use std::time::{Duration, Instant};
+
 use tempfile::TempDir;
 use vprogs_scheduling_scheduler::{ExecutionConfig, Scheduler};
 use vprogs_storage_manager::StorageConfig;
@@ -527,6 +529,110 @@ pub fn test_rollback_interleaved_multi_resource() {
         AssertWrittenState(4, vec![51]).assert(runtime.storage_manager().store());
 
         runtime.shutdown();
+    }
+}
+
+/// Tests that resources are properly evicted from the cache after their batches commit.
+/// Verifies that the resource cache doesn't grow unboundedly when processing many batches
+/// with unique resources.
+#[test]
+pub fn test_resource_eviction() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let mut runtime = Scheduler::new(
+            ExecutionConfig::default().with_vm(TestVM),
+            StorageConfig::default().with_store(storage),
+        );
+
+        // Schedule many batches, each with unique resources.
+        // Each batch touches 10 unique resources.
+        const NUM_BATCHES: usize = 100;
+        const RESOURCES_PER_BATCH: usize = 10;
+
+        let mut batches = Vec::with_capacity(NUM_BATCHES);
+        for batch_idx in 0..NUM_BATCHES {
+            let base_resource = batch_idx * RESOURCES_PER_BATCH;
+            let txs: Vec<_> = (0..RESOURCES_PER_BATCH)
+                .map(|i| Tx(base_resource + i, vec![Access::Write(base_resource + i)]))
+                .collect();
+            batches.push(runtime.schedule(txs));
+        }
+
+        // Wait for all batches to commit.
+        for batch in &batches {
+            batch.wait_committed_blocking();
+        }
+
+        // Wait for cache to be fully evicted (with timeout).
+        wait_for_empty_cache(&mut runtime, Duration::from_secs(10));
+
+        // Verify that the data was actually written correctly for a sample of resources.
+        for batch_idx in [0, 50, 99] {
+            let base_resource = batch_idx * RESOURCES_PER_BATCH;
+            for i in 0..RESOURCES_PER_BATCH {
+                let resource_id = base_resource + i;
+                AssertWrittenState(resource_id, vec![resource_id])
+                    .assert(runtime.storage_manager().store());
+            }
+        }
+
+        runtime.shutdown();
+    }
+}
+
+/// Tests eviction behavior with high-frequency scheduling.
+/// Rapidly schedules batches in waves and verifies cache is cleared after each wave.
+#[test]
+pub fn test_eviction_under_load() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let mut runtime = Scheduler::new(
+            ExecutionConfig::default().with_vm(TestVM),
+            StorageConfig::default().with_store(storage),
+        );
+
+        // Schedule batches in waves, checking cache is cleared after each wave.
+        const WAVES: usize = 10;
+        const BATCHES_PER_WAVE: usize = 50;
+
+        for wave in 0..WAVES {
+            let base = wave * BATCHES_PER_WAVE;
+
+            // Schedule a wave of batches.
+            let batches: Vec<_> = (0..BATCHES_PER_WAVE)
+                .map(|i| {
+                    let resource_id = base + i;
+                    runtime.schedule(vec![Tx(resource_id, vec![Access::Write(resource_id)])])
+                })
+                .collect();
+
+            // Wait for all batches in this wave to commit.
+            for batch in &batches {
+                batch.wait_committed_blocking();
+            }
+
+            // Wait for cache to be fully evicted (with timeout).
+            wait_for_empty_cache(&mut runtime, Duration::from_secs(10));
+        }
+
+        runtime.shutdown();
+    }
+}
+
+/// Repeatedly processes the eviction queue until the cache is empty or timeout is reached.
+fn wait_for_empty_cache(runtime: &mut Scheduler<RocksDbStore, TestVM>, timeout: Duration) {
+    let start = Instant::now();
+    while runtime.cached_resource_count() > 0 {
+        if start.elapsed() > timeout {
+            panic!(
+                "Timeout waiting for cache to empty. Still have {} cached resources.",
+                runtime.cached_resource_count()
+            );
+        }
+        runtime.process_eviction_queue();
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
